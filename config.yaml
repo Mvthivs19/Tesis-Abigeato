@@ -1,0 +1,54 @@
+# Configuración central del sistema de detección de intrusos.
+# Todos los módulos (inferencia, alertas, grabación, BD, monitoreo) leen
+# sus parámetros desde acá. Ajusta aquí, no dentro del código.
+
+model:
+  weights_path: "runs_detect/intrusos_nir_v1/weights/best.pt"
+  conf_threshold: 0.5          # confianza mínima para considerar una detección válida
+  device: 0                    # 0 = primera GPU (CUDA). Usa "cpu" si no hay GPU disponible
+  imgsz: 416
+
+classes:
+  # Debe coincidir con el orden usado al entrenar (03_prepare_yolo_dataset.py)
+  names: ["humano", "bovino", "equino", "ovino", "porcino"]
+  human_class: "humano"
+  livestock_classes: ["bovino", "equino", "ovino", "porcino"]
+
+camera:
+  # Fuente del "video simulado". Puede ser:
+  #   - ruta a un archivo de video (mp4/avi) que simule el feed de la cámara
+  #   - 0 (índice de webcam, si quieres probar con tu propia cámara)
+  source: "data/sample_video.mp4"
+  fps_limit: 10                # limita FPS de procesamiento (emula Edge de bajo consumo)
+  reconnect_wait_seconds: 5    # espera antes de reintentar si se corta el "stream"
+
+zone:
+  # Polígono de vigilancia (RE01). Se llena automáticamente con
+  # src/05_define_zone.py. Formato: lista de [x, y] en píxeles del frame.
+  polygon: []
+
+alerts:
+  cooldown_seconds: 30         # tiempo mínimo entre alertas repetidas del mismo evento
+  local:
+    enabled: true               # RE12: alerta visual/sonora simulada en caseta virtual
+  deterrent:
+    enabled: true               # RE14: simular encendido de luces/sirena
+  remote:
+    enabled: false              # RE13: notificación remota (activar si tienes un webhook)
+    webhook_url: "https://TU_WEBHOOK_AQUI"
+    timeout_seconds: 5
+    max_retries_per_cycle: 3     # RE19: reintentos si no hay Internet
+
+recording:
+  pre_event_seconds: 5          # segundos de video ANTES del evento (buffer circular)
+  post_event_seconds: 10        # segundos de video DESPUÉS del evento
+  output_dir: "data/event_clips"
+
+database:
+  path: "data/events.db"
+
+health_monitor:
+  check_interval_seconds: 60
+  cpu_threshold_percent: 90
+  ram_threshold_percent: 90
+  log_path: "data/logs/health.log"

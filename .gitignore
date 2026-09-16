@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+venv/
+.env
+*.db
+*.sqlite3
+.idea/
+.vscode/
+*.log
+
+# Archivos grandes
+*.zip
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# Dataset images y videos
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.mp4
+*.avi
+*.mov
+
+# Directorios de datos y modelos
+data/
+runs/
+runs_detect/
+output/
+labels/
+datasets/
+
+# Carpeta Tesis-Abigaeto completa (contiene datasets pesados)
+Tesis-Abigaeto/
