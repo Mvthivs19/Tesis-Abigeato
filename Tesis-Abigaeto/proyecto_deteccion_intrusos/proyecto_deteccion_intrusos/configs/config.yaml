@@ -35,6 +35,10 @@ alerts:
   # RE15: si el operador no confirma la alerta en este plazo, el sistema
   # escala el evento a nivel de emergencia y reintenta la notificacion remota.
   escalate_after_seconds: 60
+  # RE15: un evento sin confirmar mas antiguo que esto NO se escala. Sin este
+  # tope, reiniciar el sistema con una alerta vieja vuelve a disparar la
+  # emergencia de forma falsa.
+  max_escalation_age_seconds: 259200
   local:
     enabled: true
   deterrent:
@@ -45,6 +49,31 @@ alerts:
     timeout_seconds: 5
     max_retries_per_cycle: 3
     max_attempts_per_notification: 10
+# RE02: programacion de horarios de monitoreo.
+schedule:
+  enabled: true
+  log_transitions: true
+  windows:
+    - start: "20:00"
+      end: "06:00"
+# RE11: filtrado de ruido y condiciones ambientales.
+frame_filter:
+  enabled: true
+  min_contrast: 18.0
+  max_brightness: 235.0
+  min_brightness: 8.0
+  blur_threshold: 28.0
+  noise_threshold: 12.0
+  smooth_ratio: 0.25
+  history_size: 8
+# RE21: integridad fisica de la camara.
+integrity:
+  enabled: true
+  max_shift_pixels: 18.0
+  signal_loss_frames: 30
+  degraded_frames: 20
+  min_fps: 5.0
+  debounce_seconds: 8.0
 recording:
   pre_event_seconds: 5
   post_event_seconds: 10
@@ -61,3 +90,46 @@ health_monitor:
   cpu_threshold_percent: 90
   ram_threshold_percent: 90
   log_path: data/logs/health.log
+# RE18: exportacion de falsos positivos para reentrenamiento.
+retraining:
+  output_dir: data/false_positive_dataset
+  copy_snapshots: true
+  copy_clips: false
+# Objetivo 4: medicion de falsos positivos y analisis de ROI.
+evaluation:
+  output_dir: data/evaluation
+  # Clips SIN intrusiones reales para medir el FPR. Deben grabarse en la
+  # finca: el set de validacion del proyecto contiene personas, por lo que un
+  # disparo alli puede ser una deteccion correcta y no un falso positivo.
+  negative_clips:
+    - data/sample_video.mp4
+  # VERDICTOS HONESTOS: mientras esto sea false, el informe declara el FPR
+  # como NO VERIFICABLE. Ponlo en true solo cuando los clips de arriba esten
+  # grabados en la finca y se haya confirmado que NO hay intrusiones en ellos.
+  negative_clips_verified: false
+  # Minutos de video negativo minimos para que la cifra sea representativa.
+  min_negative_minutes: 10
+
+  # Supuestos economicos del ROI (Objetivo 4).
+  #
+  # ATENCION: estos valores son EJEMPLOS, no datos de esta finca. El ROI que
+  # sale de ellos no es una medicion: es el resultado de lo que se suponga aqui.
+  # Reemplaza cada monto por el tuyo antes de presentar el analisis.
+  roi:
+    # --- Dimension de la perdida ---
+    ganado: 35                    # animales totales en la finca
+    animales_por_evento: 3        # animales que se lleva un abigeato tipico
+    valor_por_animal: 180000      # CLP, valor promedio de un animal
+    eventos_anuales_estimados: 2  # abigeatos por ano en la zona
+    # --- Efectividad ---
+    detecciones_por_evento: 1.0   # fraccion de eventos que el sistema detecta
+    evitacion_por_deteccion: 0.7  # fraccion de la perdida evitada al avisar
+    # --- Costos ---
+    costo_camara: 320000          # CLP, camara + instalacion
+    costo_equipo: 480000          # CLP, equipo de computo
+    costo_instalacion: 150000     # CLP, mano de obra de instalacion
+    costo_mantenimiento_anual: 90000
+    # --- Ahorro de vigilancia ---
+    horas_vigilancia_ahorradas_semana: 3
+    valor_hora_vigilancia: 7500
+    anios_analizados: 5

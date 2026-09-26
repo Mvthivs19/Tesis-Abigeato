@@ -1,51 +1,59 @@
 """
 Paso 6 (pipeline principal): integra todo el sistema.
 
+Este modulo es el MISMO flujo que la GUI (`src/gui/tab_detection.py`), no una
+copia: ambos consumen `AlertCoordinator`. Antes esta version manejaba alertas,
+clips, horarios y reintentos por su cuenta, y por eso se comportaba distinto
+que la interfaz: la GUI no emitia clips, el CLI no respeta el horario de RE02 y
+ninguno de los dos aplicaba el filtro de calidad de RE11.
+
   RE06 - Procesa el flujo de video nocturno simulado, emulando las
          restricciones de un dispositivo Edge de bajo consumo (fps
          limitado, modelo liviano YOLOv8n).
   RE01 - Restringe la inferencia a la zona (polígono) definida con
          05_define_zone.py.
-  RE12/RE14 - Dispara alertas locales y disuasión simulada.
-  RE13/RE17 - Guarda snapshot + clip de evidencia y encola notificación.
-  RE19 - Sigue operando localmente aunque falle el envío remoto.
-  RE21 - Corre el monitor de salud en paralelo.
+  RE02 - Programa las ventanas horarias de monitoreo.
+  RE04 - Avisa a los contactos de emergencia registrados.
+  RE11 - Filtra ruido y condiciones ambientales (borroso, negro, ruido).
+  RE12 - Alerta local en la caseta de vigilancia.
+  RE13 - Notificacion remota con evidencia visual (encolada si no hay red).
+  RE14 - Respuesta disuasoria.
+  RE15 - Escala el evento si el operador no lo confirma, con tope de antigüedad.
+  RE17 - Guarda snapshot + clip de evidencia (pre + post evento).
+  RE19 - Sigue operando localmente aunque falle el envio remoto.
+  RE20 - Sincroniza la cola cuando vuelve la conectividad.
+  RE21 - Corre el monitor de integridad de la camara en paralelo.
 
 Uso:
-  python src/06_realtime_pipeline.py
-Presiona 'q' en la ventana de video para detener el sistema.
+  python src/06_realtime_pipeline.py                 # deteccion con ventana
+  python src/06_realtime_pipeline.py --headless      # deteccion sin ventana
+  python src/06_realtime_pipeline.py --evaluate      # solo FPR + ROI y salir
+  python src/06_realtime_pipeline.py --seconds 120   # corre 2 min y para
+
+Teclas durante la ejecucion:
+  q  detener    ESPACIO  pausar/reanudar
+  a  confirmar la ultima alerta (RE15)
+  f  marcar la ultima alerta como falso positivo (RE18)
+  s  sincronizar la cola offline ahora (RE20)
 """
 
+import argparse
 import os
+import sys
 import time
 
 import cv2
 import numpy as np
-import torch
 
-# --- Parche de compatibilidad ---
-# Mismo parche que en 04_train.py: PyTorch 2.6+ cambió el valor por defecto
-# de `weights_only` en torch.load(), lo que rompe la carga del modelo ya
-# entrenado en versiones de ultralytics no actualizadas. Confiamos en el
-# origen del archivo (nuestro propio modelo entrenado localmente).
-_original_torch_load = torch.load
+# Permite ejecutar el archivo suelto (`python src/06_realtime_pipeline.py`)
+# sin tener que instalar el paquete `src`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _original_torch_load(*args, **kwargs)
-
-
-torch.load = _patched_torch_load
-# --- Fin del parche ---
-
-from ultralytics import YOLO
-
-from utils import load_config, get_logger
-from database import EventDatabase
-from video_recorder import ClipRecorder
-from alert_system import AlertSystem
-from health_monitor import HealthMonitor
+from src.utils import load_config, get_logger
+from src.database import EventDatabase
+from src.alert_coordinator import AlertCoordinator
+from src.model_loader import load_yolo
+from src.health_monitor import HealthMonitor
 
 logger = get_logger("pipeline_principal")
 
@@ -69,16 +77,86 @@ def open_capture(source, logger, wait_seconds):
         time.sleep(wait_seconds)
 
 
-def main():
-    config = load_config()
+def draw_overlay(frame, polygon, detections, human_class, text_lines):
+    """Dibuja la zona, las cajas y el HUD sobre una COPIA del frame.
+
+    Devuelve el frame anotado. Es el unico frame que entra al buffer del
+    clip probatorio (RE17): un frame capturado debe corresponden a un frame
+    del clip, o la evidencia queda desalineada con la hora de la alerta.
+    """
+    annotated = frame.copy()
+    if polygon:
+        cv2.polylines(annotated, [np.array(polygon, dtype="int32")], True, (0, 255, 0), 2)
+
+    for det in detections:
+        x1, y1, x2, y2 = (int(v) for v in det["xyxy"])
+        color = (0, 0, 255) if det["class"] == human_class else (255, 200, 0)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        label = f"{det['class']} {det['confidence']:.2f}"
+        cv2.putText(annotated, label, (x1, max(y1 - 8, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    for i, line in enumerate(text_lines):
+        y = 20 + i * 18
+        cv2.putText(annotated, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 255, 255), 1)
+    return annotated
+
+
+def run_evaluation(config, db, model):
+    """Objetivo 4: mide FPR y ROI, escribe los informes y devuelve el codigo
+    de salida. No entra en modo deteccion."""
+    from src.fpr_evaluation import FPREvaluation
+    from src.roi_analysis import ROIAnalysis
+
+    evaluation_cfg = config.get("evaluation", {})
+    clips = list(evaluation_cfg.get("negative_clips", []))
+
+    if clips:
+        logger.info(f"[CLI] Evaluacion FPR sobre {len(clips)} clip(s).")
+        fpr = FPREvaluation(config, db=db, model=model)
+        report = fpr.evaluate_dataset(
+            clips,
+            progress=lambda i, total, name: logger.info(f"[CLI]   ({i}/{total}) {name}"),
+        )
+        logger.info(f"[CLI] FPR: {fpr.format_report(report)}")
+        logger.info(f"[CLI] Informe: {fpr.output_path}")
+    else:
+        logger.warning("[CLI] evaluation.negative_clips vacio: no se midio FPR.")
+
+    logger.info("[CLI] Analisis ROI con los parametros economicos configurados.")
+    roi = ROIAnalysis(config, db=db)
+    roi_report = roi.compute()
+    logger.info(f"[CLI] ROI: {roi.format_report(roi_report)}")
+    logger.info(f"[CLI] Informe: {roi.output_path}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Pipeline de deteccion de intrusiones")
+    parser.add_argument("--headless", action="store_true",
+                        help="no abre ventana de video (util para pruebas)")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="solo ejecuta FPR + ROI y termina")
+    parser.add_argument("--seconds", type=float, default=0.0,
+                        help="detiene el pipeline tras N segundos (0 = hasta 'q')")
+    parser.add_argument("--config", default=None,
+                        help="ruta alterna de configuracion YAML")
+    args = parser.parse_args(argv)
+
+    config = load_config(args.config) if args.config else load_config()
 
     weights_path = config["model"]["weights_path"]
     if not os.path.exists(weights_path):
         logger.error(f"No se encontró el modelo entrenado en: {weights_path}")
         logger.error("Corre primero src/04_train.py para generar 'best.pt'.")
-        return
+        return 1
 
-    model = YOLO(weights_path)
+    # Un unico punto de carga del modelo en todo el sistema: aplica la
+    # allowlist de PyTorch >= 2.6. Antes este archivo parcheaba torch.load
+    # con weights_only=False, lo que desactiva la proteccion contra
+    # ejecucion de codigo al deserializar el checkpoint.
+    model = load_yolo(weights_path, device=config["model"].get("device"))
     class_names = config["classes"]["names"]
     human_class = config["classes"]["human_class"]
     conf_threshold = config["model"]["conf_threshold"]
@@ -86,13 +164,12 @@ def main():
     imgsz = config["model"]["imgsz"]
 
     db = EventDatabase(config["database"]["path"])
-    recorder = ClipRecorder(
-        output_dir=config["recording"]["output_dir"],
-        pre_seconds=config["recording"]["pre_event_seconds"],
-        post_seconds=config["recording"]["post_event_seconds"],
-        fps=config["camera"]["fps_limit"],
-    )
-    alerts = AlertSystem(config, db)
+
+    if args.evaluate:
+        return run_evaluation(config, db, model)
+
+    # Todo el flujo de alerta vive en el coordinador (RE02/04/11/12-15/17/19-21).
+    coordinator = AlertCoordinator(config, db)
 
     health_monitor = HealthMonitor(config, db)
     health_monitor.start()
@@ -107,12 +184,19 @@ def main():
     frame_interval = 1.0 / fps_limit
 
     cap = open_capture(source, logger, config["camera"]["reconnect_wait_seconds"])
-    logger.info("Pipeline principal iniciado. Presiona 'q' para detener, ESPACIO para pausar.")
+    logger.info("Pipeline principal iniciado. q=salir, ESPACIO=pausa, a=confirmar, "
+                "f=falso positivo, s=sincronizar.")
+    if coordinator.schedule.enabled:
+        logger.info(f"[RE02] Horario activo: {coordinator.schedule.describe()} | "
+                    f"proxima transicion: {coordinator.schedule.next_transition()}")
 
-    last_notification_retry = 0
-    notification_retry_interval = 30  # segundos
     paused = False
-    display = None
+    last = None
+    started_at = time.time()
+    fps_measured = 0.0
+    frame_times = []
+    hud = {}
+    last_hud_refresh = 0.0
 
     try:
         while True:
@@ -137,82 +221,123 @@ def main():
                         cap = open_capture(source, logger, config["camera"]["reconnect_wait_seconds"])
                         continue
 
-                results = model.predict(
-                    frame, imgsz=imgsz, conf=conf_threshold, device=device, verbose=False
-                )[0]
+                # RE11: calidad del frame ORIGINAL, antes de dibujar nada.
+                frame, quality, quality_score, _metrics = coordinator.push_frame(frame)
 
-                display = frame.copy()
-                if polygon:
-                    cv2.polylines(display, [np.array(polygon, dtype="int32")], True, (0, 255, 0), 2)
+                # RE21: compromiso físico de la cámara (giro, tápano, pérdida
+                # de señal, FPS deprimido).
+                status, detail, _compromised = coordinator.watch_integrity(frame, fps=fps_measured)
 
-                human_detected_in_zone = None
+                # RE02/RE11/RE21: sin estas tres condiciones el sistema NO
+                # puede afirmar con confianza lo que ve, asi que no infiere.
+                allowed = coordinator.can_detect()
 
-                for box in results.boxes:
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    class_name = class_names[cls_id]
+                detections = []
+                best_human = None
+                best_box = None
+                if allowed:
+                    results = model.predict(
+                        frame, imgsz=imgsz, conf=conf_threshold, device=device, verbose=False
+                    )[0]
+                    for box in results.boxes:
+                        cls_id = int(box.cls[0])
+                        if cls_id >= len(class_names):
+                            continue
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                        detections.append({
+                            "xyxy": (x1, y1, x2, y2),
+                            "class": class_names[cls_id],
+                            "confidence": float(box.conf[0]),
+                            "in_zone": point_in_zone(cx, cy, polygon),
+                        })
+                        if class_names[cls_id] == human_class and point_in_zone(cx, cy, polygon):
+                            if best_human is None or float(box.conf[0]) > best_human:
+                                best_human = float(box.conf[0])
+                                best_box = (x1, y1, x2, y2)
 
-                    in_zone = point_in_zone(cx, cy, polygon)
-                    color = (0, 0, 255) if class_name == human_class else (255, 200, 0)
-                    cv2.rectangle(display, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                    cv2.putText(display, f"{class_name} {conf:.2f}", (int(x1), int(y1) - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # RE02/RE11/RE21: FPS real para el monitor de integridad.
+                frame_times.append(loop_start)
+                frame_times = [t for t in frame_times if loop_start - t <= 5.0]
+                fps_measured = (len(frame_times) - 1) / max(
+                    frame_times[-1] - frame_times[0], 1e-6
+                ) if len(frame_times) > 1 else 0.0
 
-                    if class_name == human_class and in_zone:
-                        human_detected_in_zone = conf
+                now = time.time()
+                if now - last_hud_refresh > 1.0:
+                    last_hud_refresh = now
+                    hud = coordinator.hud_status()
 
-                recorder.push_frame(display)
+                lines = [
+                    f"FPS {fps_measured:.1f} | calidad {quality} ({quality_score:.2f}) | "
+                    f"integridad {status}",
+                    f"RE02 horario: {hud.get('schedule', '-')} "
+                    f"{'ACTIVO' if hud.get('schedule_active') else 'FUERA'}",
+                ]
+                if coordinator.suspended_reason:
+                    lines.append(f"SUSPENDIDO: {coordinator.suspended_reason}")
+                if coordinator.escalation_notice:
+                    lines.append(coordinator.escalation_notice)
+                if paused:
+                    lines.append("PAUSADO (barra espaciadora para reanudar)")
 
-                if human_detected_in_zone is not None and alerts.cooldown_ok(human_class):
-                    alerts.mark_alerted(human_class)
+                # RE17: una sola entrada al buffer, con el frame YA anotado.
+                annotated = draw_overlay(frame, polygon, detections, human_class, lines)
+                coordinator.push_annotated(annotated)
 
-                    snapshot_path = os.path.join(
-                        config["recording"]["output_dir"], f"snapshot_{int(time.time())}.jpg"
-                    )
-                    cv2.imwrite(snapshot_path, display)
+                # RE12/13/14/15/17/19/20: la cadena completa, con cooldown,
+                # snapshot, clip, disuasión, cola offline y contactos (RE04).
+                if best_human is not None:
+                    bbox = ",".join(f"{v:.1f}" for v in best_box) if best_box else None
+                    event_id = coordinator.register_intrusion(annotated, best_human,
+                                                              bbox=bbox)
+                    if event_id:
+                        logger.info(f"Evento {event_id} registrado (RE12/13/14/17).")
 
-                    event_id = db.insert_event(
-                        class_name=human_class,
-                        confidence=human_detected_in_zone,
-                        snapshot_path=snapshot_path,
-                    )
-                    clip_path = recorder.trigger(event_id)
+                # RE15/19/20: reintentos de la cola y escalamiento por inacción.
+                coordinator.tick()
 
-                    alerts.trigger_local_alert(human_class, human_detected_in_zone)
-                    alerts.trigger_deterrent()
-                    alerts.send_remote_notification(event_id, human_class, human_detected_in_zone, snapshot_path)
+                last = annotated
 
-                    logger.info(f"Evento {event_id} registrado. Clip: {clip_path}")
+            if not args.headless and last is not None:
+                cv2.imshow("Sistema de deteccion (simulado)", last)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord(" "):
+                    paused = not paused
+                    logger.info("Pausado." if paused else "Reanudado.")
+                elif key == ord("a"):
+                    event_id, error = coordinator.acknowledge_last()
+                    logger.info(f"[RE15] Confirmacion: {error or f'evento {event_id} confirmado'}")
+                elif key == ord("f"):
+                    # RE18: el permissionado vive en la GUI; en consola la
+                    # operacion es explicita del operador.
+                    event_id, error = coordinator.acknowledge_last(is_false_positive=True)
+                    logger.info(f"[RE18] Falso positivo: {error or f'evento {event_id}'}")
+                elif key == ord("s"):
+                    coordinator.sync_pending(force=True)
 
-                if time.time() - last_notification_retry > notification_retry_interval:
-                    alerts.retry_pending_notifications()
-                    last_notification_retry = time.time()
-
-            estado = "PAUSADO (barra espaciadora para reanudar)" if paused else "Presiona 'q' para salir, ESPACIO para pausar"
-            display_mostrado = display.copy()
-            cv2.putText(display_mostrado, estado, (10, display_mostrado.shape[0] - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-            cv2.imshow("Sistema de deteccion (simulado)", display_mostrado)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if args.seconds and (time.time() - started_at) >= args.seconds:
+                logger.info(f"Tiempo de prueba cumplido ({args.seconds}s). Deteniendo.")
                 break
-            elif key == ord(" "):
-                paused = not paused
-                logger.info("Pausado." if paused else "Reanudado.")
 
             elapsed = time.time() - loop_start
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
 
+    except KeyboardInterrupt:
+        logger.info("Interrumpido por el usuario.")
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
         health_monitor.stop()
+        coordinator.close()
         logger.info("Pipeline principal detenido.")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

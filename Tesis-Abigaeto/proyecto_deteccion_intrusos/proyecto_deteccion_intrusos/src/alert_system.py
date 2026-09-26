@@ -33,6 +33,7 @@ class AlertSystem:
     def __init__(self, config, db):
         self.config = config
         self.db = db
+        self.logger = logger
         self._last_alert_time = {}
 
     def cooldown_ok(self, class_name):
@@ -80,7 +81,8 @@ class AlertSystem:
         return True
 
     # ---------- RE13 + RE19: notificación remota con reintentos ----------
-    def send_remote_notification(self, event_id, class_name, confidence, snapshot_path):
+    def send_remote_notification(self, event_id, class_name, confidence,
+                                 snapshot_path, recipient=None):
         """Intenta notificar de inmediato. Si falla (sin Internet), la
         notificación ya quedó encolada en la BD (ver database.insert_event)
         y se reintentará en el próximo ciclo de retry_pending_notifications().
@@ -88,16 +90,20 @@ class AlertSystem:
         El `queue_id` se resuelve a partir del `event_id` para que, si el
         envío es exitoso, la fila de la cola quede marcada como entregada y
         no se reenvíe indefinidamente en los reintentos posteriores.
+
+        `recipient` se usa en RE04 cuando el aviso va dirigido a un contacto
+        concreto del directorio de emergencias en lugar de al canal general.
         """
         if not self.config["alerts"]["remote"]["enabled"]:
-            return
+            return False
 
-        self._try_send_one(
+        return self._try_send_one(
             queue_id=self.db.get_queue_id(event_id),
             event_id=event_id,
             class_name=class_name,
             confidence=confidence,
             snapshot_path=snapshot_path,
+            recipient=recipient,
         )
 
     def retry_pending_notifications(self):
@@ -128,10 +134,12 @@ class AlertSystem:
                     f"{max_attempts} intentos sin éxito. Queda en la cola para auditoría."
                 )
                 continue
-            self._try_send_one(queue_id, event_id, class_name, confidence, snapshot_path)
+            self._try_send_one(queue_id, event_id, class_name, confidence,
+                               snapshot_path)
             sent += 1
 
-    def _try_send_one(self, queue_id, event_id, class_name, confidence, snapshot_path):
+    def _try_send_one(self, queue_id, event_id, class_name, confidence,
+                      snapshot_path, recipient=None):
         webhook_url = self.config["alerts"]["remote"]["webhook_url"]
         timeout = self.config["alerts"]["remote"]["timeout_seconds"]
 
@@ -140,6 +148,10 @@ class AlertSystem:
             "class_name": class_name,
             "confidence": confidence,
         }
+        # RE04: el aviso identifica a quien se esta notificando.
+        if recipient:
+            payload["recipient"] = recipient
+
         try:
             if snapshot_path:
                 with open(snapshot_path, "rb") as f:
@@ -150,12 +162,15 @@ class AlertSystem:
                 response = requests.post(webhook_url, data=payload, timeout=timeout)
 
             response.raise_for_status()
-            logger.info(f"[NOTIFICACIÓN REMOTA] Evento {event_id} enviado correctamente.")
+            target = f" a {recipient}" if recipient else ""
+            logger.info(f"[NOTIFICACIÓN REMOTA] Evento {event_id} enviado correctamente{target}.")
             if queue_id is not None:
                 self.db.mark_notification_delivered(queue_id)
+            return True
 
         except requests.exceptions.RequestException as e:
             logger.error(f"[NOTIFICACIÓN REMOTA] Falló envío del evento {event_id} (sin Internet u otro error): {e}")
             if queue_id is not None:
                 self.db.increment_notification_attempt(queue_id)
             # No se relanza la excepción: el sistema sigue operando localmente (RE19)
+            return False
