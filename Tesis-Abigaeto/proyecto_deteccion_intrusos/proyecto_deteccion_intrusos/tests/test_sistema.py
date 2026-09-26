@@ -987,6 +987,29 @@ class TestRetrainingExport(unittest.TestCase):
                            "copy_clips": True},
         }
 
+    def test_stats_separates_real_class_from_predicted_class(self):
+        """RE18: agrupar solo por la clase PREDICHA dice "humano: 3", que es lo
+        que el operador ya sabe (los errores del modelo) y no le sirve para
+        decidir que corregir. La clase REAL declarada es la que determina como
+        se entrenara, y lo que no se declaro queda como fondo."""
+        from src.retraining import FalsePositiveExporter
+
+        a = self.db.insert_event("humano", 0.3, self.snap, bbox="0,0,50,50")
+        b = self.db.insert_event("humano", 0.2, self.snap, bbox="0,0,50,50")
+        c = self.db.insert_event("humano", 0.9, self.snap, bbox="0,0,50,50")
+        self.db.mark_event_acknowledged(a, is_false_positive=True,
+                                        real_class="bovino")
+        self.db.mark_event_acknowledged(b, is_false_positive=True)
+        self.db.mark_event_acknowledged(c, is_false_positive=True,
+                                        real_class="equino")
+        st = FalsePositiveExporter(self.config, self.db).stats()
+        self.assertEqual(st["total"], 3)
+        self.assertEqual(st["by_predicted"], {"humano": 3})
+        self.assertEqual(st["by_class"],
+                         {"bovino": 1, "background": 1, "equino": 1})
+        self.assertEqual(st["background"], 1)
+        self.assertEqual(st["pending_real_class"], 1)
+
     def test_export_marked_false_positives_only(self):
         e1 = self.db.insert_event("humano", 0.3, self.snap)
         self.db.insert_event("humano", 0.8, self.snap)   # no marcado
@@ -1147,7 +1170,10 @@ class TestRetrainingExport(unittest.TestCase):
         self.db.mark_event_acknowledged(eid, is_false_positive=True)
         stats = FalsePositiveExporter(self.config, self.db).stats()
         self.assertEqual(stats["total"], 1)
-        self.assertEqual(stats["by_class"], {"bovino": 1})
+        # Sin clase real declarada la muestra es un FONDO, aunque el modelo
+        # hubiera dicho "bovino": eso fue justo el error.
+        self.assertEqual(stats["by_class"], {"background": 1})
+        self.assertEqual(stats["by_predicted"], {"bovino": 1})
 
 
 # ============================================================
@@ -1238,6 +1264,67 @@ class TestFPREvaluation(unittest.TestCase):
             report = self.eval.evaluate_dataset(["a.mp4"])
         self.assertAlmostEqual(report["video_seconds"], 10.0)
         self.assertAlmostEqual(report["false_positives_per_minute"], 60.0)
+
+    def test_verified_with_false_positives_does_not_meet_target(self):
+        """Direccion critica: ground truth verificado, datos suficientes y
+        aun asi NO se cumple el objetivo. El veredicto debe ser NO CUMPLE, no
+        NO VERIFICABLE: aqui si se midio y la medicion sale mal. Sin esto, un
+        sistema que dispara de mas podria presentarse como "aun no verificable"
+        en lugar de como incumplido."""
+        self.config["evaluation"]["negative_clips_verified"] = True
+        self.config["evaluation"]["min_negative_minutes"] = 1
+        with unittest.mock.patch.object(
+                FPREvaluation, "evaluate_video",
+                return_value={"video": "a.mp4", "fps": 30.0, "frames_processed": 1800,
+                              "duration_s": 60.0, "human_detections_in_zone": 4,
+                              "scenes_with_fp": 1, "false_positives": []}):
+            report = self.eval.evaluate_dataset(["a.mp4"])
+        self.assertTrue(report["ground_truth_verified"])
+        self.assertTrue(report["data_sufficient"])
+        self.assertFalse(report["meets_target"],
+                         "con disparo en la escena el objetivo <5% NO se cumple")
+        self.assertEqual(FPREvaluation.format_report(report)["verdict"],
+                         "NO CUMPLE")
+
+    def test_five_percent_boundary_is_exclusive(self):
+        """El objetivo es < 5%, no <= 5%. Exactamente 5% (1 de 20 escenas) es
+        incumplimiento: la ronda debe contar como escena con disparo."""
+        self.config["evaluation"]["negative_clips_verified"] = True
+        self.config["evaluation"]["min_negative_minutes"] = 1
+        clips = [f"c{i}.mp4" for i in range(20)]
+        results = [{"video": path, "fps": 30.0, "frames_processed": 1800,
+                    "duration_s": 60.0, "human_detections_in_zone": 0,
+                    "scenes_with_fp": 0, "false_positives": []}
+                   for path in clips]
+        results[0]["human_detections_in_zone"] = 2
+        results[0]["scenes_with_fp"] = 1
+        with unittest.mock.patch.object(FPREvaluation, "evaluate_video",
+                                        side_effect=results):
+            report = self.eval.evaluate_dataset(clips)
+        self.assertAlmostEqual(report["fpr_per_scene"], 0.05)
+        self.assertFalse(report["meets_target"])
+        self.assertEqual(FPREvaluation.format_report(report)["verdict"],
+                         "NO CUMPLE")
+
+    def test_verdict_of_is_the_single_source_for_log_and_gui(self):
+        """El log del evaluador y la vista de Evaluation deben coincidir. Se
+        comprueba que `verdict_of` cubre los cuatro estados, porque cualquier
+        hueco aqui se traduce en una pantalla que contradice al informe."""
+        cases = [
+            ({"meets_target": True, "ground_truth_verified": True,
+              "data_sufficient": True}, "CUMPLE"),
+            ({"meets_target": False, "ground_truth_verified": False,
+              "data_sufficient": False}, "NO VERIFICABLE"),
+            ({"meets_target": False, "ground_truth_verified": True,
+              "data_sufficient": False}, "DATOS INSUFICIENTES"),
+            ({"meets_target": False, "ground_truth_verified": True,
+              "data_sufficient": True}, "NO CUMPLE"),
+        ]
+        for report, expected in cases:
+            with self.subTest(verdict=expected):
+                self.assertEqual(FPREvaluation.verdict_of(report), expected)
+                self.assertEqual(FPREvaluation.format_report(report)["verdict"],
+                                 expected)
 
     def test_report_is_written(self):
         self.eval.evaluate_dataset([])

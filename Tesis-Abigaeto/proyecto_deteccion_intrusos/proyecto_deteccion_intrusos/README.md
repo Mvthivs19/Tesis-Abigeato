@@ -117,10 +117,20 @@ actualiza los drivers de NVIDIA y repite el primer `pip install`.
 
 ```powershell
 python tests\test_sistema.py
+python tests\test_gui_navigation.py
+python tests\test_re18_dialog.py
+python tests\test_roi_sensitivity.py
 ```
 
-Debe terminar en `OK`. Si `pytest` no está instalado, este script funciona
-igual: usa `unittest` de la biblioteca estándar.
+Cada uno debe terminar en `OK`. Si `pytest` no está instalado, estos scripts
+funcionan igual: usan `unittest` de la biblioteca estándar.
+
+| Archivo | Qué cubre |
+|---|---|
+| `test_sistema.py` | 130 pruebas: módulos, base de datos, RE y CLI |
+| `test_gui_navigation.py` | Recorre la aplicación real: login por rol, todas las vistas renderizan y la navegación no deja hilos vivos |
+| `test_re18_dialog.py` | El diálogo de falso positivo rama por rama, hasta la etiqueta YOLO escrita en disco |
+| `test_roi_sensitivity.py` | Que el ROI responda a cada supuesto económico y no sea un número fijo |
 
 ---
 
@@ -136,6 +146,16 @@ python src\05_define_zone.py
 Marca los puntos con **click izquierdo** (mínimo 3) y guarda con `s`.
 
 También puedes editarla a mano en `configs/config.yaml` → `zone.polygon`.
+
+> **Rehaz la zona antes de desplegar.** El polígono que viene en el repositorio
+> está dibujado para un encuadre concreto: sobre el video de ejemplo
+> (1080x1920, vertical) cubre solo el **37%** del frame y su borde inferior
+> llega hasta y=776, mientras que las personas aparecen alrededor de
+> y=1270-1440. Esas detecciones son correctas pero caen fuera de la zona, así
+> que el sistema no dispara. Una zona mal trazada no produce una falsa alarma:
+> produce **vigilancia muda**, que es peor porque el sistema parece correcto.
+> Traza la zona sobre el encuadre real de la cámara y comprueba la cobertura;
+> `tools\verificar_fpr_maquina.py` imprime ese diagnóstico.
 
 ---
 
@@ -164,8 +184,14 @@ src\
   gui\                   <- vistas de la interfaz (una por módulo)
   06_realtime_pipeline.py<- orquestador del CLI
 tests\
-  test_sistema.py        <- 124 pruebas
+  test_sistema.py        <- 130 pruebas: modulos, BD, RE y CLI
+  test_gui_navigation.py  <- recorrido real de la GUI por rol y vista
+  test_re18_dialog.py     <- dialogo de falso positivo, rama por rama
+  test_roi_sensitivity.py <- que el ROI responde a cada supuesto
   smoke_deteccion.py     <- prueba de humo con el modelo real
+tools\
+  verificar_fpr_maquina.py <- recorre un clip con el modelo real y muestra
+                              el veredicto, el informe y el diagnostico de zona
 data\                    <- NO se versiona en Git (eventos, clips, logs)
 runs_detect\             <- pesos y métricas del entrenamiento
 ```

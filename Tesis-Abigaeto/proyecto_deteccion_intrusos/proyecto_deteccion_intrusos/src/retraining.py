@@ -267,14 +267,34 @@ class FalsePositiveExporter:
                 "clips": clips, "output_dir": target}
 
     def stats(self):
-        """Resumen para la GUI."""
+        """Resumen para la GUI.
+
+        Se reportan las DOS lecturas, no solo una. Agrupar por la clase PREDICHA
+        es lo que el operador ya conoce (son los errores que el propio modelo
+        cometio) y no le dice nada de que corregir. La clase REAL declarada es
+        la que decide como se entrenara, y las muestras sin clase real declarada
+        son las que van a enseñar al modelo a descartar el fondo.
+        """
         rows = self.db.get_false_positive_exports(10)
-        by_class = {}
+        by_predicted = {}
+        by_real = {}
+        pending_real = 0
         for event in self.db.get_false_positive_events(limit=2000):
-            name = event[2]
-            by_class[name] = by_class.get(name, 0) + 1
+            predicted = event[2] or "?"
+            real = event[6]
+            by_predicted[predicted] = by_predicted.get(predicted, 0) + 1
+            if real:
+                by_real[real] = by_real.get(real, 0) + 1
+            else:
+                # Sin clase real declarada la muestra es un fondo: eso fue
+                # justo el error, aunque el modelo acertara con una clase real.
+                by_real[BACKGROUND] = by_real.get(BACKGROUND, 0) + 1
+                pending_real += 1
         return {
             "total": self.db.count_false_positives(),
-            "by_class": by_class,
+            "by_class": by_real,
+            "by_predicted": by_predicted,
+            "background": by_real.get(BACKGROUND, 0),
+            "pending_real_class": pending_real,
             "exports": [{"path": r[1], "samples": r[2], "at": r[3]} for r in rows],
         }

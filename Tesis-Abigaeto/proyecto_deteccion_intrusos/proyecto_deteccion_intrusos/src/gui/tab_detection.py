@@ -54,6 +54,7 @@ class DetectionView:
         self.model_info = None
         self.running = False
         self.thread = None
+        self._coordinator_errors = 0
         self.current_frame = None
         self.display_frame = None
         self.paused = False
@@ -381,15 +382,29 @@ class DetectionView:
         self._stop_health_monitor()
 
     def _tick_coordinator(self):
-        """Drena la cola RE20 y evalua el escalamiento RE15."""
+        """Drena la cola RE20 y evalua el escalamiento RE15.
+
+        El mantenimiento periodico no puede ser fatal: antes, un fallo
+        transitorio de la base de datos (bloqueo, disco lleno) propagaba la
+        excepcion y mataba el hilo de deteccion, dejando la vigilancia muda
+        sin que nadie lo notara. Ahora se registra y el bucle continua.
+        """
         if not self.coordinator:
             return
-        self.coordinator.tick()
-        if self.coordinator.escalation_notice:
-            self._log_alert(self.coordinator.escalation_notice)
-            self.coordinator.escalation_notice = None
-        self.pending_remote, self.open_event = self.coordinator.pending_summary()
-        self.remote_enabled = self.coordinator.remote_status()["enabled"]
+        try:
+            self.coordinator.tick()
+            if self.coordinator.escalation_notice:
+                self._log_alert(self.coordinator.escalation_notice)
+                self.coordinator.escalation_notice = None
+            self.pending_remote, self.open_event = self.coordinator.pending_summary()
+            self.remote_enabled = self.coordinator.remote_status()["enabled"]
+        except Exception as exc:  # noqa: BLE001
+            self._coordinator_errors += 1
+            # Se avisa solo del primero y de cada diez: repetirlo cada frame
+            # llenaria el log y taparia la causa real.
+            if self._coordinator_errors == 1 or self._coordinator_errors % 10 == 0:
+                self._log_alert(
+                    f"Mantenimiento de alertas pendiente ({self._coordinator_errors}): {exc}")
 
     def _limit_loop(self, frame_interval, loop_start):
         """Respeta el limite de FPS configurado en `camera.fps_limit`."""
@@ -959,11 +974,19 @@ class DetectionView:
     def _stop_detection(self):
         self.running = False
         self.paused = False
+        self.display_frame = None
+        self.current_frame = None
+        # La camara se libera ANTES de unir el hilo: si el bucle esta bloqueado
+        # en `cap.read()`, liberarla es lo que lo desbloquea. Unir primero
+        # agotaria el tiempo de espera y el hilo seguiria vivo tras el cierre.
         if self.cap:
             self.cap.release()
             self.cap = None
-        self.display_frame = None
-        self.current_frame = None
+        # El hilo es daemon: sin unirlo sobrevive al cierre y sigue leyendo la
+        # camara y la base de datos despues de que la ventana ya no exista.
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3)
+        self.thread = None
 
     def _enter_zone_mode(self):
         self.zone_mode = True

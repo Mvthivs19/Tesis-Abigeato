@@ -94,7 +94,10 @@ health_monitor:
 retraining:
   output_dir: data/false_positive_dataset
   copy_snapshots: true
-  copy_clips: false
+  # El clip da el contexto que un fotograma no tiene: una sombra o una rama se
+  # distinguen mejor en movimiento. Cuesta disco (son archivos de video), asi
+  # que ponlo en false si la maquina de la finca no tiene espacio.
+  copy_clips: true
 # Objetivo 4: medicion de falsos positivos y analisis de ROI.
 evaluation:
   output_dir: data/evaluation

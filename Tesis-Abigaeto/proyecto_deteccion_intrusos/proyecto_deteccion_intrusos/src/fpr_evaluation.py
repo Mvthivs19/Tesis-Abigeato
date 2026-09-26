@@ -266,12 +266,15 @@ class FPREvaluation:
         with open(self.output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
-        if report["meets_target"]:
-            verdict = "CUMPLE"
-        elif report["ground_truth_verified"] and not report["data_sufficient"]:
-            verdict = "DATOS INSUFICIENTES"
-        else:
-            verdict = "NO VERIFICABLE"
+        # El veredicto se calcula en un solo sitio (`verdict_of`) y lo usan
+        # tanto este log como la vista de Evaluation.
+        #
+        # Ojo con el caso "verificado y suficiente pero por encima del
+        # objetivo": es NO CUMPLE, no NO VERIFICABLE. Aqui si se midio, y la
+        # medicion sale mal. Confundir "no se pudo medir" con "se midio y no
+        # cumplio" permitiria presentar como pendiente un sistema que ya se
+        # sabe que no cumple.
+        verdict = self.verdict_of(report)
 
         logger.info(
             f"[FPR] {verdict}: {report['fpr_percentage']}% "
@@ -283,17 +286,28 @@ class FPREvaluation:
         return report
 
     @staticmethod
+    def verdict_of(report):
+        """Veredicto unico del reporte.
+
+        Vive en un solo metodo a proposito: el log del evaluador y la vista de
+        Evaluation calculaban el veredicto por separado y ya se habian
+        desincronizado. Si divergen, la GUI puede mostrar una cosa y el informe
+        guardado otra, que es justo lo que no puede pasar en una tesis.
+        """
+        if report.get("meets_target"):
+            return "CUMPLE"
+        if not report.get("ground_truth_verified"):
+            return "NO VERIFICABLE"
+        if not report.get("data_sufficient"):
+            return "DATOS INSUFICIENTES"
+        return "NO CUMPLE"
+
+    @staticmethod
     def format_report(report):
         """Resumen legible para la GUI."""
-        if report.get("meets_target"):
-            verdict = "CUMPLE"
-        elif report.get("ground_truth_verified"):
-            verdict = "DATOS INSUFICIENTES"
-        else:
-            verdict = "NO VERIFICABLE"
         return {
             "fpr": f"{report.get('fpr_percentage', 0)}%",
-            "verdict": verdict,
+            "verdict": FPREvaluation.verdict_of(report),
             "scenes": f"{report.get('scenes_with_false_positives', 0)}/"
                        f"{report.get('scenes_total', 0)}",
             "total_fp": report.get("total_false_positives", 0),
