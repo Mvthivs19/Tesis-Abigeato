@@ -289,6 +289,47 @@ class TestPermissionWiring(unittest.TestCase):
         self.assertIn('get("negative_clips"', cli)
         self.assertIn('get("negative_clips")', panel)
 
+    def test_evaluation_panel_does_not_reread_reports_every_frame(self):
+        """`render` corre a ~20 FPS. Sin cache, la pestana abriria y parsearia
+        dos JSON de disco en cada frame (~40 lecturas/s) mientras la deteccion
+        sigue activa: el panel por si solo consume CPU y disco."""
+        import types
+        import time as _time
+
+        from src.gui.tab_evaluation import EvaluationView
+        from src.utils import load_config
+
+        cfg = load_config()
+        fake = types.SimpleNamespace(config=cfg, db=None, custom_buttons=[],
+                                     set_custom_buttons=lambda b: None,
+                                     notify=lambda *a, **k: None)
+        view = EvaluationView(fake)
+
+        reads = {"n": 0}
+        real_open = open
+
+        def counting_open(*a, **k):
+            reads["n"] += 1
+            return real_open(*a, **k)
+
+        import builtins
+        builtins.open = counting_open
+        try:
+            view._load_reports(force=True)
+            after_first = reads["n"]
+            # 30 frames Worth of renders without a real second elapsing.
+            for _ in range(30):
+                view._load_reports()
+                _time.sleep(0.001)
+        finally:
+            builtins.open = real_open
+
+        self.assertGreater(after_first, 0)
+        self.assertEqual(
+            reads["n"], after_first,
+            "los informes se releen en cada frame: falta la cache por mtime",
+        )
+
     def test_roi_assumptions_are_editable_in_config(self):
         """El informe de ROI dice "reemplaza los montos por los tuyos". Si los
         supuestos estuvieran fijos en el codigo, ese aviso seria imposible de

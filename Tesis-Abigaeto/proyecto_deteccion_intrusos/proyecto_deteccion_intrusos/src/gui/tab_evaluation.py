@@ -15,8 +15,10 @@ Por eso la vista nunca muestra un numero solo: cada tarjeta dice de donde sale,
 si el dato es verificable y, cuando no lo es, por que.
 """
 
+import json
 import os
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -54,31 +56,54 @@ class EvaluationView:
         self.error = None
         self._thread = None
         self.clips = []
+        # Cache de los informes en disco: mtime visto y momento del chequeo.
+        # Sin esto, `render` abriria y parsearia dos JSON en cada frame.
+        self._mtimes = {"fpr": None, "roi": None}
+        self._checked_at = 0.0
 
     # ---- Ciclo de vida ----
 
     def on_enter(self):
-        self._load_reports()
+        self._load_reports(force=True)
 
-    def _load_reports(self):
+    def _load_reports(self, force=False):
         """Lee los ultimo reportes generados en disco.
 
         Se leen del archivo y no se recomputan al abrir la pestana: abrir una
         pantalla no puede costar minutos de inferencia, ni mucho menos escribir
         un reporte nuevo como efecto secundario de mirar.
-        """
-        import json
 
-        for attr, path in (("fpr_report", self._report_path("fpr_report.json")),
-                           ("roi_report", self._report_path("roi_report.json"))):
-            report = None
+        `render` corre a ~20 FPS, asi que recargar dos JSON en cada frame serian
+        ~40 lecturas de disco por segundo mientras la deteccion sigue activa. Se
+        recarga solo si el archivo cambio (mtime) y, en cualquier caso, como
+        mucho una vez por segundo.
+        """
+        now = time.time()
+        if not force and now - self._checked_at < 1.0:
+            return
+
+        for attr, filename, box in (
+            ("fpr_report", "fpr_report.json", "fpr"),
+            ("roi_report", "roi_report.json", "roi"),
+        ):
+            path = self._report_path(filename)
             try:
-                if path and os.path.exists(path):
+                mtime = os.path.getmtime(path) if os.path.exists(path) else None
+            except OSError:
+                mtime = None
+            if mtime == self._mtimes[box] and getattr(self, attr) is not None:
+                continue
+            report = None
+            if mtime is not None:
+                try:
                     with open(path, encoding="utf-8") as f:
                         report = json.load(f)
-            except Exception:
-                report = None
+                except (OSError, ValueError):
+                    report = None
+            self._mtimes[box] = mtime
             setattr(self, attr, report)
+
+        self._checked_at = now
 
     def _report_path(self, filename):
         """Mismo directorio que usan FPREvaluation y ROIAnalysis."""
@@ -160,7 +185,7 @@ class EvaluationView:
 
     def _finish_ok(self, label, summary):
         self.result = {"label": label, "summary": summary}
-        self._load_reports()
+        self._load_reports(force=True)
         if hasattr(self.app, "notify"):
             self.app.notify(f"{label} completado", GREEN, seconds=3.0)
 
