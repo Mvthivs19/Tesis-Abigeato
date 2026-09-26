@@ -1,0 +1,22 @@
+fiftyone==0.24.1
+ultralytics==8.2.0
+opencv-python==4.9.0.80
+numpy==1.26.4
+pyyaml==6.0.1
+scikit-learn==1.4.2
+tqdm==4.66.2
+psutil==5.9.8
+requests==2.31.0
+matplotlib==3.8.3
+
+# IMPORTANTE (GPU GTX 1650):
+# `pip install -r requirements.txt` instala ultralytics, que a su vez trae
+# torch. Si torch se instala sin soporte CUDA, el entrenamiento correrá en
+# CPU aunque tengas GPU. Para asegurarte de usar la GTX 1650, instala PRIMERO
+# torch con CUDA 11.8 antes que el resto:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r requirements.txt
+#
+# Verifica que quedó bien con:
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"

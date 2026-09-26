@@ -1,37 +1,54 @@
+# --- Python / entorno ---
 __pycache__/
 *.pyc
+*.pyo
 venv/
+.venv/
 .env
-*.db
-*.sqlite3
 .idea/
 .vscode/
 *.log
 
-# Archivos grandes
+# --- Datos pesados: NO se suben ---
+# El dataset (28K imagenes, ~7 GB) y el video de demo se regeneran con:
+#   python src/01_download_dataset.py
+#   python src/03_prepare_yolo_dataset.py
+data/
+preview/
 *.zip
-*.pt
-*.pth
-*.onnx
-*.weights
-
-# Dataset images y videos
-*.jpg
-*.jpeg
-*.png
-*.bmp
-*.gif
 *.mp4
 *.avi
 *.mov
+*.mkv
 
-# Directorios de datos y modelos
-data/
-runs/
-runs_detect/
+# --- Base de datos local (se regenera al usar la app) ---
+*.db
+*.sqlite3
+*.sqlite
+
+# --- Artefactos de training que no hacen falta en el repo ---
 output/
 labels/
 datasets/
+*.onnx
+*.weights
+*.engine
+*epoch*.pt
+*last*.pt
 
-# Carpeta Tesis-Abigaeto completa (contiene datasets pesados)
-Tesis-Abigaeto/
+# Carpeta huerfana en Tesis-Abigaeto/runs/ (duplicados de runs_detect/).
+# Los runs correctos estan en proyecto_deteccion_intrusos/runs_detect/
+Tesis-Abigaeto/runs/
+
+# Pesos base preentrenados: Ultralytics los descarga solo al entrenar.
+# No hace falta versionarlos.
+yolov8*.pt
+yolov5*.pt
+*.onnx
+
+# NOTA: runs_detect/ SI se sube, pero solo lo esencial:
+#   weights/best.pt  -> modelo entrenado (el profesor lo necesita)
+#   results.csv      -> metricas por epoca
+#   results.png      -> curvas de loss y metricas
+#   confusion_matrix*.png -> matriz de confusion
+# Los checkpoints *last.pt y *epoch*.pt quedan fuera de arriba.

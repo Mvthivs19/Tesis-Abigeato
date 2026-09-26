@@ -1,0 +1,59 @@
+model:
+  weights_path: runs_detect/intrusos_custom_v15/weights/best.pt
+  conf_threshold: 0.5
+  device: 0
+  imgsz: 640
+classes:
+  names:
+  - humano
+  - bovino
+  - equino
+  - ovino
+  - porcino
+  human_class: humano
+  livestock_classes:
+  - bovino
+  - equino
+  - ovino
+  - porcino
+camera:
+  source: data/sample_video.mp4
+  fps_limit: 10
+  reconnect_wait_seconds: 5
+zone:
+  polygon:
+  - - 1
+    - 5
+  - - 1009
+    - 8
+  - - 1004
+    - 776
+  - - 9
+    - 772
+alerts:
+  cooldown_seconds: 30
+  local:
+    enabled: true
+  deterrent:
+    enabled: true
+  remote:
+    enabled: false
+    webhook_url: https://TU_WEBHOOK_AQUI
+    timeout_seconds: 5
+    max_retries_per_cycle: 3
+recording:
+  pre_event_seconds: 5
+  post_event_seconds: 10
+  output_dir: data/event_clips
+database:
+  path: data/events.db
+training:
+  epochs: 40
+  imgsz: 640
+  batch: 8
+  patience: 20
+health_monitor:
+  check_interval_seconds: 60
+  cpu_threshold_percent: 90
+  ram_threshold_percent: 90
+  log_path: data/logs/health.log

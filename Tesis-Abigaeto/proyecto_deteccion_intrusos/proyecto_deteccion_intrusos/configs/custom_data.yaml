@@ -1,0 +1,10 @@
+path: C:\Users\mabad\Desktop\Tesis\Tesis-Abigaeto\proyecto_deteccion_intrusos\proyecto_deteccion_intrusos\data\custom_yolo
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: humano
+  1: bovino
+  2: equino
+  3: ovino
+  4: porcino
