@@ -32,6 +32,9 @@ zone:
     - 772
 alerts:
   cooldown_seconds: 30
+  # RE15: si el operador no confirma la alerta en este plazo, el sistema
+  # escala el evento a nivel de emergencia y reintenta la notificacion remota.
+  escalate_after_seconds: 60
   local:
     enabled: true
   deterrent:
@@ -41,6 +44,7 @@ alerts:
     webhook_url: https://TU_WEBHOOK_AQUI
     timeout_seconds: 5
     max_retries_per_cycle: 3
+    max_attempts_per_notification: 10
 recording:
   pre_event_seconds: 5
   post_event_seconds: 10

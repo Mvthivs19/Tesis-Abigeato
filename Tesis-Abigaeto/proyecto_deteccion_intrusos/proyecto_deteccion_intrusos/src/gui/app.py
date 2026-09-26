@@ -380,7 +380,10 @@ class Application:
             tw = cv2.getTextSize(part, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)[0][0]
             tx += tw + 20
 
-        hint = "Q: salir  |  H: dashboard"
+        if self.current_view == "detection":
+            hint = "ESPACIO: pausa  |  A: confirmar  |  F: falso pos.  |  Q: salir"
+        else:
+            hint = "Q: salir  |  H: dashboard"
         hw = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)[0][0]
         cv2.putText(canvas, hint, (WIN_W - 26 - hw, WIN_H - 11),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.32, TEXT_MUTED, 1, cv2.LINE_AA)

@@ -21,6 +21,8 @@ from src.gui.app import (
     rounded_rect, badge, progress_bar, section_title,
 )
 from src.database import EventDatabase
+from src.alert_coordinator import AlertCoordinator
+from src.health_monitor import HealthMonitor
 
 try:
     from ultralytics import YOLO
@@ -60,6 +62,16 @@ class DetectionView:
         self.inference_ms = 0.0
         self._fps_mark = time.time()
         self._frame_mark = 0
+
+        # Cadena de alerta completa (RE12/13/14/15/17/19/20) y monitor de
+        # salud (RE21). Se crean al iniciar la deteccion, no aqui, porque el
+        # ClipRecorder debe vivir durante toda la sesion de video.
+        self.coordinator = None
+        self.health = None
+        self.pending_remote = 0
+        self.open_event = None
+        self.escalation_notice = None
+        self._ack_buttons = []
 
         self._load_model()
         self._load_zone()
@@ -113,6 +125,12 @@ class DetectionView:
         if self.running:
             return
 
+        # Si el hilo anterior sigue cerrando (el usuario detuvo y reinicio
+        # rapido), se espera para que no compitan dos loops de deteccion
+        # sobre el mismo source.
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3)
+
         source = self.app.config["camera"]["source"]
         if isinstance(source, str) and not source.isdigit() and not os.path.exists(source):
             return
@@ -133,6 +151,7 @@ class DetectionView:
         self.frame_count = 0
         self._frame_mark = 0
         self._fps_mark = time.time()
+        self.escalation_notice = None
         self.thread = threading.Thread(target=self._detection_loop, daemon=True)
         self.thread.start()
 
@@ -146,6 +165,12 @@ class DetectionView:
         human_class = self.app.config["classes"]["human_class"]
 
         db = EventDatabase(self.app.config["database"]["path"])
+
+        # Cadena de alerta RE12/13/14/15/17/19/20 y monitor de salud RE21.
+        # Antes la GUI solo escribia en la BD, por lo que no disparaba
+        # alertas, no guardaba clips y no drenaba la cola offline.
+        self.coordinator = AlertCoordinator(self.app.config, db)
+        self._start_health_monitor(db)
 
         while self.running:
             if self.paused:
@@ -165,6 +190,7 @@ class DetectionView:
 
             zone_pts = self._zone_in_frame()
 
+            intrusion = False
             if self.model:
                 infer_start = time.time()
                 results = self.model.predict(
@@ -195,7 +221,7 @@ class DetectionView:
                                          (cx, cy), in_zone, human_class)
 
                     if class_name == human_class and in_zone:
-                        self._register_alert(display, db, conf, human_class)
+                        intrusion = True
 
             if zone_pts is not None and len(zone_pts):
                 overlay = display.copy()
@@ -216,6 +242,31 @@ class DetectionView:
             new_w, new_h = int(w * scale), int(h * scale)
             display = cv2.resize(display, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+            # RE17: el frame YA anotado alimenta el buffer circular, para que
+            # el clip probatorio muestre los bounding boxes y la zona.
+            self.coordinator.push_frame(display)
+
+            # RE12/13/14/16/17: cadena de alerta ante intrusion en la zona.
+            if intrusion:
+                event_id = self.coordinator.register_intrusion(
+                    display, max(
+                        (d["confidence"] for d in self.detections
+                         if d["class"] == human_class and d["in_zone"]),
+                        default=0.0,
+                    ),
+                    human_class,
+                )
+                if event_id is not None:
+                    self._log_alert(f"INTRUSO e{event_id} conf ver HUD")
+
+            # RE15/19/20: reintentos de la cola offline y escalamiento.
+            self.coordinator.tick()
+            self.escalation_notice = self.coordinator.escalation_notice
+            if self.coordinator.escalation_notice:
+                self._log_alert(self.coordinator.escalation_notice)
+                self.coordinator.escalation_notice = None
+            self.pending_remote, self.open_event = self.coordinator.pending_summary()
+
             self.display_frame = display
 
             if time.time() - self._fps_mark >= 1.0:
@@ -226,6 +277,33 @@ class DetectionView:
             elapsed = time.time() - loop_start
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
+
+        # Cierre ordenado de los servicios auxiliares.
+        if self.coordinator:
+            self.coordinator.close()
+        self._stop_health_monitor()
+
+    def _start_health_monitor(self, db):
+        """RE21: vigilancia de CPU/RAM en hilo aparte, sin afectar la inferencia."""
+        try:
+            self.health = HealthMonitor(self.app.config, db)
+            self.health.start()
+        except Exception:
+            self.health = None
+
+    def _stop_health_monitor(self):
+        if self.health:
+            try:
+                self.health.stop()
+                self.health.join(timeout=2)
+            except Exception:
+                pass
+            self.health = None
+
+    def _log_alert(self, msg):
+        self.alerts_log.append((time.strftime("%H:%M:%S"), msg))
+        if len(self.alerts_log) > 200:
+            del self.alerts_log[:-200]
 
     def _draw_detection(self, frame, class_name, conf, bbox, center, in_zone, human_class):
         x1, y1, x2, y2 = bbox
@@ -251,27 +329,18 @@ class DetectionView:
             cv2.drawMarker(frame, (int(cx), int(cy)), (0, 230, 255),
                            cv2.MARKER_CROSS, 16, 1, cv2.LINE_AA)
 
-    def _register_alert(self, display, db, conf, human_class):
-        now = time.time()
-        cooldown = self.app.config["alerts"]["cooldown_seconds"]
-        if now - self.last_alert_time <= cooldown:
+    def _acknowledge_open_event(self, is_false_positive=False):
+        """RE15/RE18: el operador confirma el evento abierto desde el panel de
+        alertas. Al confirmar se detiene el escalamiento."""
+        if not self.coordinator:
             return
-
-        self.last_alert_time = now
-        snapshot_path = os.path.join(
-            self.app.config["recording"]["output_dir"],
-            f"snapshot_{int(now)}.jpg"
-        )
-        os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-        cv2.imwrite(snapshot_path, display)
-
-        db.insert_event(
-            class_name=human_class,
-            confidence=conf,
-            snapshot_path=snapshot_path,
-        )
-        msg = f"INTRUSO en zona (conf {conf:.0%})"
-        self.alerts_log.append((time.strftime("%H:%M:%S"), msg))
+        event_id = self.coordinator.acknowledge_last(is_false_positive)
+        if event_id is None:
+            return
+        self.escalation_notice = None
+        msg = "confirmado" if not is_false_positive else "marcado FALSO POSITIVO"
+        self._log_alert(f"Evento e{event_id} {msg}")
+        self.pending_remote, self.open_event = self.coordinator.pending_summary()
 
     def _draw_zone_label(self, frame, zone_pts):
         if zone_pts is None or not len(zone_pts):
@@ -385,8 +454,37 @@ class DetectionView:
                 cv2.putText(canvas, ht, (hx + 6, y + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.36, RED, 1, cv2.LINE_AA)
 
+        self._draw_escalation_banner(canvas, x, y, w, h)
+
         # Marco
         cv2.rectangle(canvas, (x, y), (x + w, y + h), BORDER_HI, 1)
+
+    def _draw_escalation_banner(self, canvas, x, y, w, h):
+        """RE15: banda de escalamiento mientras haya un evento sin confirmar."""
+        if not self.open_event:
+            return
+        event_id, class_name, confidence = self.open_event
+        escalate_after = self.app.config["alerts"].get("escalate_after_seconds", 60)
+
+        bh = 30
+        by = y + 34
+        cv2.rectangle(canvas, (x + 8, by), (x + 8 + 320, by + bh), (35, 35, 120), -1)
+        cv2.rectangle(canvas, (x + 8, by), (x + 8 + 320, by + bh), ORANGE, 1)
+
+        txt = f"ALERTA ACTIVA e{event_id}  {class_name} {confidence:.0%}"
+        cv2.putText(canvas, txt, (x + 18, by + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, TEXT_WHITE, 1, cv2.LINE_AA)
+
+        sub = f"escalara en {escalate_after}s si no confirmas"
+        cv2.putText(canvas, sub, (x + 18, by + bh + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, ORANGE, 1, cv2.LINE_AA)
+
+        # RE19/RE20: notificaciones esperando reconexion.
+        if self.pending_remote:
+            q = f"offline: {self.pending_remote} en cola"
+            cv2.putText(canvas, q, (x + w - cv2.getTextSize(
+                q, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)[0][0] - 12, by + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, ORANGE, 1, cv2.LINE_AA)
 
     def _render_side_panel(self, canvas, x, y, h):
         """Panel lateral: detecciones + alertas."""
@@ -433,20 +531,45 @@ class DetectionView:
         rounded_rect(canvas, (x, ay), (x + panel_w, ay + ah), 10, BG_CARD)
         section_title(canvas, x + 12, ay + 22, "ALERTAS", panel_w - 30)
 
-        recent = self.alerts_log[-10:]
+        # RE15/RE18: acciones de confirmacion sobre el evento abierto.
+        list_y = ay + 46
+        if self.open_event:
+            self._ack_buttons = [
+                {"rect": (x + 12, list_y, 0, 0, panel_w - 24, 26), "action": "ack"},
+                {"rect": (x + 12, list_y + 32, 0, 0, panel_w - 24, 26), "action": "fp"},
+            ]
+            bw = panel_w - 24
+            self._ack_buttons[0]["rect"] = (x + 12, list_y, x + 12 + bw, list_y + 26)
+            self._ack_buttons[1]["rect"] = (x + 12, list_y + 32, x + 12 + bw, list_y + 58)
+
+            rounded_rect(canvas, (x + 12, list_y), (x + 12 + bw, list_y + 26), 5, GREEN)
+            cv2.putText(canvas, "Confirmar alerta", (x + 12 + bw // 2 - 52, list_y + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (20, 20, 20), 1, cv2.LINE_AA)
+
+            rounded_rect(canvas, (x + 12, list_y + 32), (x + 12 + bw, list_y + 58), 5, BG_INPUT)
+            cv2.putText(canvas, "Marcar falso positivo", (x + 12 + bw // 2 - 72, list_y + 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, TEXT_DIM, 1, cv2.LINE_AA)
+
+            list_y += 76
+        else:
+            self._ack_buttons = []
+
+        recent = self.alerts_log[-8:]
         if not recent:
-            cv2.putText(canvas, "Sin alertas registradas", (x + 14, ay + 52),
+            cv2.putText(canvas, "Sin alertas registradas", (x + 14, list_y + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.34, TEXT_MUTED, 1, cv2.LINE_AA)
-            cv2.putText(canvas, "Se genera al detectar humano", (x + 14, ay + 72),
+            cv2.putText(canvas, "Se genera al detectar humano", (x + 14, list_y + 34),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, TEXT_MUTED, 1, cv2.LINE_AA)
         else:
             for i, (ts, msg) in enumerate(reversed(recent)):
-                ry = ay + 48 + i * 26
+                ry = list_y + 12 + i * 26
+                if ry > ay + ah - 14:
+                    break
                 rounded_rect(canvas, (x + 10, ry - 13), (x + panel_w - 10, ry + 11), 5, BG_INPUT)
                 cv2.circle(canvas, (x + 20, ry - 1), 3, RED, -1)
                 cv2.putText(canvas, ts, (x + 30, ry + 3),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.3, TEXT_MUTED, 1, cv2.LINE_AA)
-                cv2.putText(canvas, msg[:22], (x + 78, ry + 3),
+                cv2.putText(canvas, msg[:26], (x + 78, ry + 3),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.3, RED, 1, cv2.LINE_AA)
 
     # ---------- Controles ----------
@@ -502,7 +625,16 @@ class DetectionView:
         self.app.set_custom_buttons([])
 
     def on_click(self, mx, my):
-        if not self.zone_mode or self.current_frame is None:
+        # Botones de confirmacion del panel de alertas (RE15/RE18).
+        if not self.zone_mode:
+            for btn in self._ack_buttons:
+                x1, y1, x2, y2 = btn["rect"]
+                if x1 <= mx <= x2 and y1 <= my <= y2:
+                    self._acknowledge_open_event(btn["action"] == "fp")
+                    return
+            return
+
+        if self.current_frame is None:
             return
 
         fx = SIDEBAR_W + 26
@@ -531,6 +663,15 @@ class DetectionView:
                 self._cancel_zone()
         elif key == ord(" "):
             self._toggle_pause()
+        elif key == ord("a"):
+            # RE15: confirmar atajo.
+            self._acknowledge_open_event(False)
+        elif key == ord("f"):
+            # RE18: marcar falso positivo atajo.
+            self._acknowledge_open_event(True)
 
     def cleanup(self):
         self._stop_detection()
+        if self.coordinator:
+            self.coordinator.close()
+        self._stop_health_monitor()

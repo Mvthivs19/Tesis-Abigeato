@@ -32,10 +32,19 @@ class ClipRecorder:
         self.writer = None
         self.frames_left = 0
         self.current_path = None
+        self._rec_size = None
 
     def push_frame(self, frame):
         self.buffer.append(frame.copy())
         if self.recording and self.writer is not None:
+            size = (frame.shape[1], frame.shape[0])
+            if size != self._rec_size:
+                # La resolucion cambio a mitad de grabacion (por ejemplo, el
+                # source se reconecto a una camara de otro tamano). Un
+                # VideoWriter no acepta frames de otro tamano, asi que se
+                # cierra el clip actual en vez de generar un archivo corrupto.
+                self._close_writer()
+                return
             self.writer.write(frame)
             self.frames_left -= 1
             if self.frames_left <= 0:
@@ -46,7 +55,12 @@ class ClipRecorder:
         if self.recording:
             return self.current_path  # ya hay una grabación de evento en curso
 
-        h, w = self.buffer[-1].shape[:2] if self.buffer else (480, 640)
+        # Se copia el buffer antes de recorrerlo: el hilo de deteccion puede
+        # seguir empujando frames mientras se vuelca el pre-evento, y mutar un
+        # deque durante su iteracion lanza RuntimeError.
+        buffered = list(self.buffer)
+
+        h, w = buffered[-1].shape[:2] if buffered else (480, 640)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"evento_{event_id}_{timestamp}.mp4"
         path = os.path.join(self.output_dir, filename)
@@ -55,12 +69,13 @@ class ClipRecorder:
         self.writer = cv2.VideoWriter(path, fourcc, self.fps, (w, h))
 
         # Vuelca el buffer pre-evento (contexto de antes del incidente)
-        for buffered_frame in self.buffer:
+        for buffered_frame in buffered:
             self.writer.write(buffered_frame)
 
         self.recording = True
         self.frames_left = self.post_seconds * self.fps
         self.current_path = path
+        self._rec_size = (w, h)
         return path
 
     def _close_writer(self):
@@ -69,3 +84,4 @@ class ClipRecorder:
         self.writer = None
         self.recording = False
         self.current_path = None
+        self._rec_size = None

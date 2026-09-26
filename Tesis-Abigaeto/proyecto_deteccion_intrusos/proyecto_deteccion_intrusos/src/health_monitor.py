@@ -12,7 +12,12 @@ import time
 
 import psutil
 
-from utils import get_logger
+try:
+    # Importado como modulo de la GUI: src.health_monitor
+    from src.utils import get_logger
+except ImportError:
+    # Importado como modulo suelto por 06_realtime_pipeline.py: health_monitor
+    from utils import get_logger
 
 
 class HealthMonitor(threading.Thread):

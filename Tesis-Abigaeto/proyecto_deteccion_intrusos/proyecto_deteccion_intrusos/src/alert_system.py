@@ -19,7 +19,12 @@ llamada real (ej. a un microcontrolador vía GPIO/MQTT).
 import time
 import requests
 
-from utils import get_logger
+try:
+    # Importado como modulo de la GUI: src.alert_system
+    from src.utils import get_logger
+except ImportError:
+    # Importado como modulo suelto por 06_realtime_pipeline.py: alert_system
+    from utils import get_logger
 
 logger = get_logger("alertas")
 
@@ -59,16 +64,36 @@ class AlertSystem:
         # (GPIO, MQTT, API de un controlador) si en el futuro se despliega
         # en campo. Por ahora queda como acción simulada/loggeada.
 
+    # ---------- RE15: escalamiento por inacción ----------
+    def trigger_escalation(self, event_id, class_name, waited_seconds):
+        """El operador no confirmó la alerta dentro del plazo pactado: se
+        eleva el evento a nivel de emergencia (notificación remota prioritaria
+        + registro explícito en el log y en la BD)."""
+        logger.error(
+            f"[ALERTA ESCALADA] Evento {event_id} ('{class_name}') sin confirmar "
+            f"durante {waited_seconds}s. Se escala a nivel de emergencia."
+        )
+        if self.config["alerts"]["deterrent"]["enabled"]:
+            logger.error(
+                "[DISUASIÓN REFORZADA] Disuasión repetida por inacción del operador."
+            )
+        return True
+
     # ---------- RE13 + RE19: notificación remota con reintentos ----------
     def send_remote_notification(self, event_id, class_name, confidence, snapshot_path):
         """Intenta notificar de inmediato. Si falla (sin Internet), la
         notificación ya quedó encolada en la BD (ver database.insert_event)
-        y se reintentará en el próximo ciclo de retry_pending_notifications()."""
+        y se reintentará en el próximo ciclo de retry_pending_notifications().
+
+        El `queue_id` se resuelve a partir del `event_id` para que, si el
+        envío es exitoso, la fila de la cola quede marcada como entregada y
+        no se reenvíe indefinidamente en los reintentos posteriores.
+        """
         if not self.config["alerts"]["remote"]["enabled"]:
             return
 
         self._try_send_one(
-            queue_id=None,  # se resuelve dentro de retry_pending si aplica
+            queue_id=self.db.get_queue_id(event_id),
             event_id=event_id,
             class_name=class_name,
             confidence=confidence,
@@ -79,16 +104,32 @@ class AlertSystem:
         """Debe llamarse periódicamente desde el loop principal. Revisa la
         cola de notificaciones no entregadas (por caídas de Internet) y
         reintenta enviarlas. Esto es lo que garantiza RE19: el sistema no
-        pierde eventos aunque se corte la conectividad."""
+        pierde eventos aunque se corte la conectividad.
+
+        Las notificaciones que superan `max_attempts_per_notification` se
+        abandonan (quedan en la cola como no entregadas para auditoria, pero
+        ya no se reintentan) para no quedar reenviando indefinidamente.
+        """
         if not self.config["alerts"]["remote"]["enabled"]:
             return
 
         pending = self.db.get_pending_notifications()
         max_retries = self.config["alerts"]["remote"]["max_retries_per_cycle"]
+        max_attempts = self.config["alerts"]["remote"].get("max_attempts_per_notification", 10)
 
-        for row in pending[:max_retries]:
+        sent = 0
+        for row in pending:
+            if sent >= max_retries:
+                break
             queue_id, event_id, timestamp, class_name, confidence, snapshot_path = row
+            if self.db.get_notification_attempts(queue_id) >= max_attempts:
+                self.logger.error(
+                    f"[NOTIFICACIÓN REMOTA] Evento {event_id} abandonado tras "
+                    f"{max_attempts} intentos sin éxito. Queda en la cola para auditoría."
+                )
+                continue
             self._try_send_one(queue_id, event_id, class_name, confidence, snapshot_path)
+            sent += 1
 
     def _try_send_one(self, queue_id, event_id, class_name, confidence, snapshot_path):
         webhook_url = self.config["alerts"]["remote"]["webhook_url"]
